@@ -1,0 +1,71 @@
+name: Org PAT Expiry Audit
+
+on:
+  schedule:
+    - cron: "17 10 * * 1"
+
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Alert window (days)"
+        # strings for workflow_dispatch
+        default: "30"
+      warn_threshold:
+        description: "Warn if ≤ N days remain"
+        default: "7"
+      fail_on_findings:
+        description: "Fail the job if any tokens are within the window"
+        type: boolean
+        default: false
+        
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyjwt cryptography requests python-dateutil
+
+      - name: Run audit
+        env:
+          GH_APP_ID: ${{ secrets.GH_APP_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
+          ORG_NAME: ${{ secrets.ORG_NAME }}
+
+        run: |
+          # Pull inputs from the event payload (always strings if present)
+          DAYS=$(jq -r '.inputs.days // empty' "$GITHUB_EVENT_PATH")
+          WARN=$(jq -r '.inputs.warn_threshold // empty' "$GITHUB_EVENT_PATH")
+          FAIL_ON_FINDINGS=$(jq -r '.inputs.fail_on_findings // empty' "$GITHUB_EVENT_PATH")
+
+          # Defaults for scheduled runs / missing inputs
+          DAYS=${DAYS:-30}
+          WARN=${WARN:-7}
+          FAIL_ON_FINDINGS=${FAIL_ON_FINDINGS:-false}
+
+          mkdir -p out
+          python .github/scripts/audit_org_pats.py \
+            --days "$DAYS" \
+            --warn-threshold "$WARN" \
+            --json out/pats.json \
+            --md out/report.md \
+            $([ "$FAIL_ON_FINDINGS" = "true" ] && echo --fail-on-findings)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pat-expiry-report
+          path: out/
+          if-no-files-found: error
