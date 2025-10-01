@@ -127,21 +127,32 @@ def paged_get(url: str, headers: Dict[str, str]) -> List[Any]:
     return items
 
 
-def list_org_fg_pats(org: str, inst_token: str) -> List[Dict[str, Any]]:
+def list_org_fg_pats(org: str, inst_token: str) -> list[dict]:
     """
-    Return metadata for approved fine-grained PATs for the org.
-    Tries historical/variant endpoints gracefully.
+    Lists approved fine-grained PATs that have access to org resources.
+    Requires the GitHub App permission:
+      Organization → Personal access tokens: Read
+    GET /orgs/{org}/personal-access-tokens
     """
     headers = {"Authorization": f"token {inst_token}", "Accept": "application/vnd.github+json"}
-    candidates = [
-        f"{GITHUB_API}/orgs/{org}/personal-access-tokens?state=approved",
-        f"{GITHUB_API}/orgs/{org}/fine_grained_personal_access_tokens?state=approved",
-    ]
-    for base in candidates:
-        items = paged_get(base, headers)
-        if items:
-            return items
-    return []
+    items, page = [], 1
+    base = f"{GITHUB_API}/orgs/{org}/personal-access-tokens"
+    while True:
+        url = f"{base}?per_page=100&page={page}"
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code == 403:
+            LOG.error("403 from list PATs API. Ensure the App has Organization → 'Personal access tokens: Read'.")
+            r.raise_for_status()
+        r.raise_for_status()
+        batch = r.json() or []
+        if not isinstance(batch, list) or not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    LOG.info("List PATs API returned %d item(s).", len(items))
+    return items
 
 
 def render_markdown(findings: List[Dict[str, Any]], org: str, window_days: int, warn_threshold: int) -> str:
@@ -219,33 +230,35 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     horizon = now + timedelta(days=args.days)
 
-    findings: List[Dict[str, Any]] = []
+    findings = []
     for t in tokens:
-        exp = t.get("expires_at")
-        if not exp:
+        # NOTE: fields from GET /orgs/{org}/personal-access-tokens
+        #   token_expires_at, token_last_used_at, token_name, token_id, owner{login}, permissions{}, repositories_url, access_granted_at, token_expired
+        expiry = t.get("token_expires_at") or t.get("expires_at")  # support both just in case
+        if not expiry:
             continue
         try:
-            exp_dt = isoparse(exp)
+            exp_dt = isoparse(expiry)
         except Exception:
             continue
 
         if exp_dt <= horizon:
             days_left = max(0, (exp_dt - now).days)
             severity = "CRITICAL" if days_left <= args.warn_threshold else "WARN"
-            findings.append(
-                {
-                    "id": t.get("id"),
-                    "owner": (t.get("owner") or {}).get("login") or t.get("owner_login"),
-                    "note": t.get("name") or t.get("note"),
-                    "expires_at": exp_dt.isoformat(),
-                    "days_left": days_left,
-                    "severity": severity,
-                    "last_used_at": t.get("last_used_at"),
-                    "created_at": t.get("created_at"),
-                    "repositories_count": len(t.get("repositories") or []),
-                    "permissions": sorted(list((t.get("permissions") or {}).keys())),
-                }
-            )
+            findings.append({
+                "id": t.get("token_id") or t.get("id"),
+                "owner": (t.get("owner") or {}).get("login"),
+                "note": t.get("token_name") or t.get("name") or t.get("note"),
+                "expires_at": exp_dt.isoformat(),
+                "days_left": days_left,
+                "severity": severity,
+                "last_used_at": t.get("token_last_used_at"),
+                "created_at": t.get("access_granted_at") or t.get("created_at"),
+                # repositories_url is provided; counting repos would require extra calls, so omit count here
+                "repositories_count": None,
+                "permissions": sorted(list((t.get("permissions") or {}).get("organization", {}).keys()) +
+                                    list((t.get("permissions") or {}).get("repository", {}).keys())) or None,
+            })
 
     # logs
     if findings:
